@@ -1,0 +1,10 @@
+
+sensor_monitor:
+
+g++ -o sensor_monitor sensor_monitor.cpp -lpaho-mqttpp3 -lpaho-mqtt3as -pthread
+./sensor_monitor 5 5000
+
+data_processor:
+
+g++ -o data_processor data_processor.cpp -lpaho-mqttpp3 -lpaho-mqtt3as -pthread
+./data_processor
