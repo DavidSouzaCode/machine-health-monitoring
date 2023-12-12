@@ -1,5 +1,7 @@
 {
     "files.associations": {
-        "cstdlib": "cpp"
+        "cstdlib": "cpp",
+        "*.ipp": "cpp",
+        "chrono": "cpp"
     }
 }
