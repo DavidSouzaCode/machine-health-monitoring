@@ -153,10 +153,17 @@ int main(int argc, char *argv[])
     }
     string client_id = "sensor-monitor";
     mqtt::client client(BROKER_ADDRESS, client_id);
+
+
+std::srand(std::time(0));
+    int delay_seconds = std::rand() % 5;  // Ajuste conforme necessário
+    std::this_thread::sleep_for(std::chrono::seconds(delay_seconds));
+
     // Conecta-se ao broker MQTT
     mqtt::connect_options conn_opts;
     conn_opts.set_keep_alive_interval(20);
     conn_opts.set_clean_session(true);
+
     try
     {
         client.connect(conn_opts);
@@ -168,6 +175,7 @@ int main(int argc, char *argv[])
     }
     clog << "Conectado ao broker" << endl
          << endl;
+         
     // Obtém o identificador único da máquina, neste caso, o nome do host
     char hostname[1024];
     gethostname(hostname, 1024);

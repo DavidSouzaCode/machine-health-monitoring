@@ -6,8 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 find_package(PkgConfig REQUIRED)
 find_package(PahoMqttCpp REQUIRED)
 
-add_executable(sensor_monitor sensor_monitor.cpp)
-target_link_libraries(sensor_monitor PahoMqttCpp::paho-mqttpp3)
+add_executable(sensor_monitor sensor_monitor.cpp )
+target_link_libraries(sensor_monitor PahoMqttCpp::paho-mqtt3as)
 
 add_executable(data_processor data_processor.cpp)
-target_link_libraries(data_processor PahoMqttCpp::paho-mqttpp3)
+target_link_libraries(data_processor PahoMqttCpp::paho-mqtt3as)
