@@ -1,71 +1,253 @@
 #include <iostream>
+#include <sstream>
 #include <cstdlib>
 #include <chrono>
 #include <thread>
-#include <unistd.h>
-#include "json.hpp" 
-#include "mqtt/client.h" 
+#include <deque>
+#include <map>
+#include <numeric>
+#include <boost/asio.hpp>
+#include "json.hpp"
+#include "mqtt/client.h"
+#include "mqtt/connect_options.h"
 
 #define QOS 1
 #define BROKER_ADDRESS "tcp://localhost:1883"
-#define GRAPHITE_HOST "graphite"
+#define GRAPHITE_HOST "127.0.0.1"
 #define GRAPHITE_PORT 2003
+#define TIME_FROM_SENSOR_MONITOR_IN_SECONDS 1
+#define USED_MEMORY_THRESHOLD 7290.0
+#define RUNNING_PROCESSES_THRESHOLD 520.0
 
-void post_metric(const std::string& machine_id, const std::string& sensor_id, const std::string& timestamp_str, const int value) {
+namespace asio = boost::asio;
+using namespace std;
+using asio::ip::tcp;
 
+// Function declarations
+string timestamp_to_unix(const string &timestamp);
+string unix_to_timestamp(const time_t &timestamp);
+void publish_to_graphite(const string &metric);
+void post_metric(const string &machine_id, const string &uniqueSensor_id, const string &timestamp_str, const int value);
+double find_sensor_frequency();
+void inactivity_alarm_processing();
+double calculate_moving_average(const string &machine_id, const string &uniqueSensor_id, int new_value);
+void custom_processing(const string &machine_id, const string &uniqueSensor_id, int value);
+vector<string> split(const string &str, char delim);
+void update_sensor_activity(const string &machine_id, const string &sensor_id);
+
+// Map para rastrear o último tempo de atividade de cada sensor
+map<pair<string, string>, chrono::steady_clock::time_point> last_sensor_activity;
+
+// Obtém o tempo atual
+chrono::steady_clock::time_point start_time = chrono::steady_clock::now();
+
+// Map para armazenar as últimas leituras de cada sensor
+map<pair<string, string>, deque<int>> last_sensor_readings;
+
+// Classe de retorno de chamada MQTT
+class MQTTCallback : public virtual mqtt::callback
+{
+public:
+    void message_arrived(mqtt::const_message_ptr msg) override
+    {
+        // Parse da mensagem MQTT
+        auto j = nlohmann::json::parse(msg->get_payload());
+        string topic = msg->get_topic();
+        auto topic_parts = split(topic, '/');
+        string machine_id = topic_parts[2];
+        string sensor_id = topic_parts[3];
+        string timestamp = j["timestamp"];
+        int value = j["value"];
+        // Publica a métrica e realiza processamento personalizado
+        post_metric(machine_id, sensor_id, timestamp, value);
+        update_sensor_activity(machine_id, sensor_id);
+        custom_processing(machine_id, sensor_id, value);
+    }
+};
+
+int main(int argc, char *argv[])
+{
+    // Configuração do cliente MQTT
+    string client_id = "client_id";
+    mqtt::async_client client(BROKER_ADDRESS, client_id);
+    MQTTCallback cb;
+    client.set_callback(cb);
+    mqtt::connect_options conn_opts;
+    conn_opts.set_keep_alive_interval(20);
+    conn_opts.set_clean_session(true);
+    try
+    {
+        // Conexão ao broker MQTT e subscrição a tópicos
+        client.connect(conn_opts)->wait();
+        client.subscribe("/sensors/#", QOS);
+        cout << "subscribed" << endl
+             << endl;
+    }
+    catch (mqtt::exception &e)
+    {
+        cerr << "error: " << e.what() << endl;
+        return EXIT_FAILURE;
+    }
+    while (true)
+    {
+        // Processamento do alarme de inatividade
+        inactivity_alarm_processing();
+        this_thread::sleep_for(chrono::seconds(1));
+    }
+    return EXIT_SUCCESS;
 }
 
-std::vector<std::string> split(const std::string &str, char delim) {
-    std::vector<std::string> tokens;
-    std::string token;
-    std::istringstream tokenStream(str);
-    while (std::getline(tokenStream, token, delim)) {
+
+
+// Função para converter timestamp em Unix (Unix é o tempo atual em segundos desde 01/01/1970)
+string timestamp_to_unix(const string &timestamp)
+{
+    tm t = {};
+    istringstream ss(timestamp);
+    ss >> get_time(&t, "%Y-%m-%dT%H:%M:%S");
+    time_t time_stamp = mktime(&t);
+    return to_string(time_stamp);
+}
+
+// Função para converter Unix em timestamp
+string unix_to_timestamp(const time_t &timestamp)
+{
+    tm *ptm = localtime(&timestamp);
+    char buffer[32];
+    strftime(buffer, 32, "%Y-%m-%dT%H:%M:%S", ptm);
+    return string(buffer);
+}
+
+// Função para publicar a métrica no servidor Graphite
+void publish_to_graphite(const string &metric)
+{
+    try
+    {
+        // Cria um contexto de I/O para operações assíncronas
+        asio::io_context io_context;
+        // Cria um socket TCP para comunicação com o servidor Graphite
+        tcp::socket socket(io_context);
+        // Cria um resolvedor para converter o nome do host e a porta em um endpoint
+        tcp::resolver resolver(io_context);
+        // Resolve o nome do host e a porta para obter um endpoint
+        asio::connect(socket, resolver.resolve(GRAPHITE_HOST, to_string(GRAPHITE_PORT)));
+        // Envia a métrica ao servidor Graphite
+        asio::write(socket, asio::buffer(metric));
+    }
+    catch (const exception &e)
+    {
+        cerr << "error in publish_to_graphite: " << e.what() << endl;
+    }
+}
+
+// Função para criar e postar a métrica no Graphite
+void post_metric(const string &machine_id, const string &sensor_id, const string &timestamp_str, const int value)
+{
+    try
+    {
+        // Cria o caminho da métrica usando o machine_id e o sensor_id
+        string metric_path = machine_id + "." + sensor_id;
+        // Constrói a métrica em uma string
+        string graphite_metric = metric_path + " " + to_string(value) + " " + timestamp_to_unix(timestamp_str) + "\n";
+        // Publica a métrica no Graphite
+        publish_to_graphite(graphite_metric);
+        // Printa a métrica postada no Graphite
+        string print_graphite_metric = metric_path + " " + to_string(value) + " " + timestamp_str;
+        cout << "posted: " << print_graphite_metric << endl
+             << endl;
+    }
+    catch (const exception &e)
+    {
+        cerr << "error in post_metric: " << e.what() << endl;
+    }
+}
+
+// Função para calcular a média móvel dos últimos 5 valores
+double calculate_moving_average(const string &machine_id, const string &sensor_id, int new_value)
+{
+    // Mantém apenas os últimos 5 valores
+    auto &readings = last_sensor_readings[{machine_id, sensor_id}];
+    readings.push_back(new_value);
+    if (readings.size() > 5)
+        readings.pop_front();
+    // Calcula a média móvel
+    double sum = accumulate(readings.begin(), readings.end(), 0.0);
+    return sum / readings.size();
+}
+
+// Função para processamento personalizado
+void custom_processing(const string &machine_id, const string &sensor_id, int value)
+{
+    time_t current_time = time(nullptr);
+    // Calcula a média móvel dos últimos 5 valores
+    double moving_average = calculate_moving_average(machine_id, sensor_id, value);
+    // Define um limite para acionar um alarme
+    double threshold = 0.0;
+    if (sensor_id == "used_memory")
+    {
+        threshold = USED_MEMORY_THRESHOLD;
+    }
+    else if (sensor_id == "running_processes")
+    {
+        threshold = RUNNING_PROCESSES_THRESHOLD;
+    }
+    // Se a média móvel ultrapassar o limite, gera um alarme
+    if (moving_average > threshold)
+    {
+        string alarm_path = machine_id + ".alarms.high_moving_average." + sensor_id;
+        string message = alarm_path + " 1 " + unix_to_timestamp(time(nullptr)) + "\n";
+        publish_to_graphite(message);
+        post_metric(machine_id, "alarms.high_moving_average." + sensor_id, unix_to_timestamp(current_time), 1);
+    }
+}
+
+vector<string> split(const string &str, char delim)
+{
+    vector<string> tokens;
+    string token;
+    istringstream token_stream(str);
+    while (getline(token_stream, token, delim))
+    {
         tokens.push_back(token);
     }
     return tokens;
 }
 
-int main(int argc, char* argv[]) {
-    std::string clientId = "clientId";
-    mqtt::async_client client(BROKER_ADDRESS, clientId);
+// Obtém a frequência do sensor
+double find_sensor_frequency()
+{
+    chrono::steady_clock::time_point end_time = chrono::steady_clock::now();
+    chrono::duration<double> elapsed_time = end_time - start_time;
+    start_time = end_time;
+    return elapsed_time.count() * 10 * TIME_FROM_SENSOR_MONITOR_IN_SECONDS;
+}
 
-    // Create an MQTT callback.
-    class callback : public virtual mqtt::callback {
-    public:
-
-        void message_arrived(mqtt::const_message_ptr msg) override {
-            auto j = nlohmann::json::parse(msg->get_payload());
-
-            std::string topic = msg->get_topic();
-            auto topic_parts = split(topic, '/');
-            std::string machine_id = topic_parts[2];
-            std::string sensor_id = topic_parts[3];
-
-            std::string timestamp = j["timestamp"];
-            int value = j["value"];
-            post_metric(machine_id, sensor_id, timestamp, value);
+void inactivity_alarm_processing()
+{
+    time_t current_time = time(nullptr);
+    double frequency = find_sensor_frequency();
+    // Iteração sobre todas atividades do sensor
+    for (auto &activity : last_sensor_activity)
+    {
+        auto machine_sensor_pair = activity.first;
+        auto last_activity_time = activity.second;
+        auto machine_id = machine_sensor_pair.first;
+        auto sensor_id = machine_sensor_pair.second;
+        // Calcula o tempo decorrido desde a última atividade
+        auto elapsed_time = chrono::steady_clock::now() - last_activity_time;
+        auto elapsed_time_in_seconds = chrono::duration_cast<chrono::seconds>(elapsed_time).count();
+        // Verifica se o tempo decorrido é maior ou igual a 10 períodos
+        if (elapsed_time_in_seconds >= frequency)
+        {
+            // Gera o alarme de inatividade
+            string alarm_path = machine_id + ".alarms.inactive." + sensor_id;
+            string message = alarm_path + " 1 " + unix_to_timestamp(current_time) + "\n";
+            post_metric(machine_id, "alarms.inactive." + sensor_id, unix_to_timestamp(current_time), 1);
         }
-    };
-
-    callback cb;
-    client.set_callback(cb);
-
-    // Connect to the MQTT broker.
-    mqtt::connect_options connOpts;
-    connOpts.set_keep_alive_interval(20);
-    connOpts.set_clean_session(true);
-
-    try {
-        client.connect(connOpts);
-        client.subscribe("/sensors/#", QOS);
-    } catch (mqtt::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return EXIT_FAILURE;
     }
+}
 
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-
-    return EXIT_SUCCESS;
+void update_sensor_activity(const string &machine_id, const string &sensor_id)
+{
+    last_sensor_activity[{machine_id, sensor_id}] = chrono::steady_clock::now();
 }

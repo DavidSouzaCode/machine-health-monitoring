@@ -4,61 +4,192 @@
 #include <ctime>
 #include <thread>
 #include <unistd.h>
-#include "json.hpp" // json handling
-#include "mqtt/client.h" // paho mqtt
+#include "json.hpp"
+#include "mqtt/client.h"
 #include <iomanip>
+#include <sstream>
+#include <vector>
+#include <sys/sysinfo.h>
+
+//#define QOS 1
+//#define BROKER_ADDRESS "tcp://localhost:1883"
+#define MONITOR_TOPIC "/sensor_monitors"
+
 
 #define QOS 1
 #define BROKER_ADDRESS "tcp://localhost:1883"
+#define GRAPHITE_HOST "127.0.0.1"
+#define GRAPHITE_PORT 2003
+#define TIME_FROM_SENSOR_MONITOR_IN_SECONDS 1 // Mudar conforme o valor passado ao sensor_monitor.cpp
+#define USED_MEMORY_THRESHOLD 7290.0
+#define RUNNING_PROCESSES_THRESHOLD 520.0
 
-int main(int argc, char* argv[]) {
-    std::string clientId = "sensor-monitor";
-    mqtt::client client(BROKER_ADDRESS, clientId);
 
-    // Connect to the MQTT broker.
-    mqtt::connect_options connOpts;
-    connOpts.set_keep_alive_interval(20);
-    connOpts.set_clean_session(true);
+using namespace std;
 
-    try {
-        client.connect(connOpts);
-    } catch (mqtt::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+// Estrutura para armazenar informações do sensor
+struct Sensor
+{
+    string sensor_id;
+    string data_type;
+    long data_interval;
+};
+
+// Função para obter a RAM usada, em MB
+int get_used_RAM()
+{
+    struct sysinfo info;
+    if (sysinfo(&info) != 0)
+    {
+        cerr << "Erro ao obter informações do sistema" << endl;
+        return -1;
+    }
+    // Calcula a RAM usada (RAM total - RAM livre)
+    int used_ram_in_mb = (info.totalram - info.freeram) / (1024 * 1024);
+    return used_ram_in_mb;
+}
+
+// Função para obter o número de processos em execução
+int get_running_processes()
+{
+    struct sysinfo info;
+    if (sysinfo(&info) != 0)
+    {
+        cerr << "Erro ao obter informações do sistema" << endl;
+        return -1;
+    }
+    return info.procs;
+}
+
+// Função para publicar a mensagem inicial
+void publish_initial_message(const string &machine_id, const vector<Sensor> &sensors, mqtt::client &client)
+{
+    // Cria um objeto JSON para a mensagem inicial
+    nlohmann::json initial_message;
+    initial_message["machine_id"] = machine_id;
+    vector<nlohmann::json> sensors_json;
+    // Para cada sensor, cria um objeto JSON com suas informações e adiciona ao vetor
+    for (const auto &sensor : sensors)
+    {
+        nlohmann::json sensor_json;
+        sensor_json["sensor_id"] = sensor.sensor_id;
+        sensor_json["data_type"] = sensor.data_type;
+        sensor_json["data_interval"] = sensor.data_interval;
+        sensors_json.push_back(sensor_json);
+    }
+    // Adiciona o vetor de sensores à mensagem JSON
+    initial_message["sensors"] = sensors_json;
+    // Cria uma mensagem MQTT com a mensagem JSON e publica para o tópico de monitoramento
+    mqtt::message msg(MONITOR_TOPIC, initial_message.dump(), QOS, false);
+    client.publish(msg);
+    // Exibe informações no console
+    clog << "Mensagem inicial publicada - Tópico: " << MONITOR_TOPIC << " - Mensagem: " << initial_message.dump() << endl
+         << endl;
+}
+
+// Função para publicar mensagens periodicamente
+void publish_initial_message_periodically(const string &machine_id, const vector<Sensor> &sensors, mqtt::client &client, int interval)
+{
+    while (true)
+    {
+        // Publica a mensagem inicial
+        publish_initial_message(machine_id, sensors, client);
+        // Dorme pelo intervalo especificado
+        this_thread::sleep_for(chrono::seconds(interval));
+    }
+}
+
+// Função para ler e publicar dados do sensor
+void read_and_publish_sensor(const string &machine_id, const Sensor &sensor, mqtt::client &client)
+{
+    // Monta o tópico MQTT para o sensor específico
+    string topic = "/sensors/" + machine_id + "/" + sensor.sensor_id;
+
+    while (true)
+    {
+        int value;
+        // Escolhe a função apropriada com base no tipo de sensor
+        if (sensor.sensor_id == "used_memory")
+        {
+            value = get_used_RAM();
+        }
+        else if (sensor.sensor_id == "running_processes")
+        {
+            value = get_running_processes();
+        }
+        else
+        {
+            cerr << "Sensor desconhecido: " << sensor.sensor_id << endl;
+            continue;
+        }
+        // Obtém o timestamp atual no formato ISO 8601
+        auto now = chrono::system_clock::now();
+        time_t now_c = chrono::system_clock::to_time_t(now);
+        tm *now_tm = localtime(&now_c);
+        stringstream ss;
+        ss << put_time(now_tm, "%FT%TZ");
+        string timestamp = ss.str();
+        // Cria um objeto JSON com os dados do sensor
+        nlohmann::json sensor_data;
+        sensor_data["timestamp"] = timestamp;
+        sensor_data["value"] = value;
+        // Cria e publica a mensagem MQTT para o tópico do sensor
+        mqtt::message msg(topic, sensor_data.dump(), QOS, false);
+        client.publish(msg);
+        // Exibe informações no console
+        clog << "Mensagem publicada - Tópico: " << topic << " - Mensagem: " << sensor_data.dump() << endl
+             << endl;
+        // Aguarda pelo intervalo definido para a leitura do sensor
+        this_thread::sleep_for(chrono::milliseconds(sensor.data_interval));
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc != 3)
+    {
+        cerr << "Uso: " << argv[0] << " <intervalo_msg_inicial_segundos> <intervalo_msg_milliseconds>" << endl;
         return EXIT_FAILURE;
     }
-    std::clog << "connected to the broker" << std::endl;
-
-    // Get the unique machine identifier, in this case, the hostname.
+    string client_id = "sensor-monitor";
+    mqtt::client client(BROKER_ADDRESS, client_id);
+    // Conecta-se ao broker MQTT
+    mqtt::connect_options conn_opts;
+    conn_opts.set_keep_alive_interval(20);
+    conn_opts.set_clean_session(true);
+    try
+    {
+        client.connect(conn_opts);
+    }
+    catch (mqtt::exception &e)
+    {
+        cerr << "Erro: " << e.what() << endl;
+        return EXIT_FAILURE;
+    }
+    clog << "Conectado ao broker" << endl
+         << endl;
+    // Obtém o identificador único da máquina, neste caso, o nome do host
     char hostname[1024];
     gethostname(hostname, 1024);
-    std::string machineId(hostname);
-
-    while (true) {
-       // Get the current time in ISO 8601 format.
-        auto now = std::chrono::system_clock::now();
-        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
-        std::tm* now_tm = std::localtime(&now_c);
-        std::stringstream ss;
-        ss << std::put_time(now_tm, "%FT%TZ");
-        std::string timestamp = ss.str();
-
-        // Generate a random value.
-        int value = rand();
-
-        // Construct the JSON message.
-        nlohmann::json j;
-        j["timestamp"] = timestamp;
-        j["value"] = value;
-
-        // Publish the JSON message to the appropriate topic.
-        std::string topic = "/sensors/" + machineId + "/rand";
-        mqtt::message msg(topic, j.dump(), QOS, false);
-        std::clog << "message published - topic: " << topic << " - message: " << j.dump() << std::endl;
-        client.publish(msg);
-
-        // Sleep for some time.
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+    string machine_id(hostname);
+    // Define sensores e suas propriedades
+    vector<Sensor> sensors = {
+        {"used_memory", "int", atoi(argv[2])},
+        {"running_processes", "int", atoi(argv[2])},
+    };
+    // Cria uma thread para publicar mensagens periodicamente
+    thread publish_thread(publish_initial_message_periodically, ref(machine_id), ref(sensors), ref(client), atoi(argv[1]));
+    // Cria threads para cada sensor
+    vector<thread> threads;
+    for (const auto &sensor : sensors)
+    {
+        // Adiciona as threads ao vetor de threads
+        threads.emplace_back(read_and_publish_sensor, ref(machine_id), sensor, ref(client));
     }
-
+    // Aguarda o término das threads
+    for (auto &thread : threads)
+    {
+        thread.join();
+    }
     return EXIT_SUCCESS;
 }
